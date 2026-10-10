@@ -233,11 +233,35 @@ end $$;
 
 -- ---------- Mesero IA (Gemini) ----------
 -- La API key vive en public.secrets y nunca sale de la base de datos.
+-- Llamada única a Gemini con límite de tiempo; nunca lanza excepción.
+create or replace function public._gemini_call(p_model text, p_key text, p_body jsonb, p_timeout_ms int) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare resp extensions.http_response;
+begin
+  perform http_set_curlopt('CURLOPT_TIMEOUT_MS', p_timeout_ms::text);
+  perform http_set_curlopt('CURLOPT_CONNECTTIMEOUT_MS', '4000');
+  begin
+    select * into resp from http((
+      'POST', 'https://generativelanguage.googleapis.com/v1beta/models/' || p_model || ':generateContent',
+      array[http_header('x-goog-api-key', p_key)], 'application/json', p_body::text)::http_request);
+  exception when others then
+    return jsonb_build_object('ok', false, 'status', 0, 'err', p_model || ': ' || sqlerrm);
+  end;
+  if resp.status <> 200 then
+    return jsonb_build_object('ok', false, 'status', resp.status, 'err', p_model || ': HTTP ' || resp.status);
+  end if;
+  return jsonb_build_object('ok', true, 'text', (resp.content::jsonb) #>> '{candidates,0,content,parts,0,text}');
+exception when others then
+  return jsonb_build_object('ok', false, 'status', 0, 'err', p_model || ': ' || sqlerrm);
+end $$;
+revoke execute on function public._gemini_call(text, text, jsonb, int) from public, anon, authenticated;
+
 create or replace function public.ai_chat(p_messages jsonb) returns jsonb
 language plpgsql security definer set search_path = public, extensions as $$
 declare
-  k text; m text; sys text; menu jsonb; body jsonb; contents jsonb;
-  resp extensions.http_response; txt text; res jsonb;
+  k text; m text; fb text; mm text; sys text; menu jsonb; body jsonb; contents jsonb;
+  gr jsonb; txt text; res jsonb; last_err text; left_ms int; no_think boolean := false;
+  t0 timestamptz := clock_timestamp();
 begin
   select value into k from secrets where key = 'gemini_key';
   if coalesce(k,'') = '' then raise exception 'El mesero IA aún no está configurado'; end if;
@@ -277,20 +301,25 @@ begin
   body := jsonb_build_object(
     'system_instruction', jsonb_build_object('parts', jsonb_build_array(jsonb_build_object('text', sys))),
     'contents', contents,
-    'generationConfig', jsonb_build_object('responseMimeType', 'application/json', 'temperature', 0.6));
+    'generationConfig', jsonb_build_object('responseMimeType', 'application/json', 'temperature', 0.6,
+                                           'thinkingConfig', jsonb_build_object('thinkingLevel', 'minimal')));
 
-  perform http_set_curlopt('CURLOPT_TIMEOUT_MS', '25000');
-  select * into resp from http((
-    'POST',
-    'https://generativelanguage.googleapis.com/v1beta/models/' || m || ':generateContent',
-    array[http_header('x-goog-api-key', k)],
-    'application/json',
-    body::text)::http_request);
+  -- Gemini a veces se cuelga sin responder: intento corto con el modelo principal,
+  -- y si falla, reintento con el modelo de respaldo. Todo dentro de ~27 s.
+  fb := coalesce(nullif((select value from settings where key = 'ai_fallback_model'), ''), 'gemini-3.1-flash-lite');
+  foreach mm in array array[m, fb, m] loop
+    left_ms := 27000 - (extract(epoch from clock_timestamp() - t0) * 1000)::int;
+    exit when left_ms < 2500;
+    gr := _gemini_call(mm, k, case when no_think then body #- '{generationConfig,thinkingConfig}' else body end, least(left_ms, 9000));
+    if (gr->>'ok')::boolean then txt := gr->>'text'; exit; end if;
+    last_err := gr->>'err';
+    -- 400 = el modelo no acepta thinkingConfig: se repite sin él
+    no_think := no_think or (gr->>'status') = '400';
+  end loop;
 
-  if resp.status <> 200 then
-    raise exception 'El mesero IA no respondió (código %)', resp.status;
+  if txt is null then
+    raise exception 'El mesero IA no respondió a tiempo (%)', left(coalesce(last_err, ''), 120);
   end if;
-  txt := (resp.content::jsonb) #>> '{candidates,0,content,parts,0,text}';
   begin
     res := txt::jsonb;
   exception when others then
@@ -298,6 +327,8 @@ begin
   end;
   return res;
 end $$;
+
+insert into public.settings (key, value) values ('ai_fallback_model', 'gemini-3.1-flash-lite') on conflict (key) do nothing;
 
 -- La llamada a Gemini puede tardar unos segundos.
 alter role anon set statement_timeout = '30s';

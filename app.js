@@ -415,10 +415,17 @@ function MenuApp() {
 // =============================================================
 const QUICK = ['🦐 Algo de mar', '🍔 Una hamburguesa', '🍕 Pizza para compartir', '🥗 Algo liviano', '🧒 Para niños', '✨ ¿Qué me recomiendas?'];
 
+// Voz: síntesis (Leo habla) + reconocimiento en modo "manos libres".
+// El micrófono se reabre solo cada vez que termina una frase; se pausa mientras Leo habla
+// para que no se escuche a sí mismo.
 function useVoice() {
   const [speaking, setSpeaking] = useState(false);
   const [listening, setListening] = useState(false);
+  const [interim, setInterim] = useState('');
+  const [micError, setMicError] = useState('');
+  const [ended, setEnded] = useState(0); // cambia cada vez que el micrófono se cierra sin texto -> se reabre
   const recRef = useRef(null);
+  const speakTimer = useRef(null);
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   const voice = useRef(null);
   useEffect(() => {
@@ -434,24 +441,45 @@ function useVoice() {
     speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '').replace(/\$(\d)/g, '$1').replace(/(\d)\.(\d{3})/g, '$1$2'));
     u.lang = voice.current?.lang || 'es-CO'; if (voice.current) u.voice = voice.current; u.rate = 1.04;
-    u.onstart = () => setSpeaking(true); u.onend = u.onerror = () => setSpeaking(false);
+    const done = () => { clearTimeout(speakTimer.current); setSpeaking(false); };
+    u.onend = u.onerror = done;
+    // "speaking" se marca de inmediato (no en onstart) para cerrar el micrófono antes de que suene la voz.
+    setSpeaking(true);
+    clearTimeout(speakTimer.current);
+    speakTimer.current = setTimeout(done, 4000 + text.length * 90); // por si el navegador nunca dispara onend
     speechSynthesis.speak(u);
   };
-  const stop = () => { try { speechSynthesis.cancel(); } catch {} setSpeaking(false); };
-  const listen = (onText, onFinal) => {
-    if (!SR) return false;
-    if (listening) { recRef.current?.stop(); return true; }
-    stop();
-    const r = new SR(); recRef.current = r;
-    r.lang = 'es-CO'; r.interimResults = true; r.continuous = false;
-    let finalText = '';
-    r.onresult = (e) => { const t = [...e.results].map((x) => x[0].transcript).join(''); onText(t); if (e.results[e.results.length - 1].isFinal) finalText = t; };
-    r.onend = () => { setListening(false); if (finalText.trim()) onFinal(finalText.trim()); };
-    r.onerror = () => setListening(false);
-    setListening(true); r.start();
-    return true;
+  const stop = () => { try { speechSynthesis.cancel(); } catch {} clearTimeout(speakTimer.current); setSpeaking(false); };
+  const stopListening = () => {
+    const r = recRef.current; recRef.current = null;
+    if (r) { r.onend = r.onresult = r.onerror = null; try { r.abort(); } catch {} }
+    setListening(false); setInterim('');
   };
-  return { speak, stop, listen, speaking, listening, canListen: !!SR };
+  const startListening = (onFinal) => {
+    if (!SR || recRef.current) return;
+    const r = new SR(); recRef.current = r;
+    r.lang = 'es-CO'; r.interimResults = true; r.continuous = false; r.maxAlternatives = 1;
+    let finalText = '';
+    r.onstart = () => { setListening(true); setMicError(''); };
+    r.onresult = (e) => {
+      const t = [...e.results].map((x) => x[0].transcript).join('');
+      setInterim(t);
+      if (e.results[e.results.length - 1].isFinal) finalText = t;
+    };
+    r.onerror = (e) => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') setMicError('Permite el uso del micrófono para hablar con Leo, o escribe tu pedido.');
+      else if (e.error === 'audio-capture') setMicError('No encontramos un micrófono en este dispositivo.');
+      else if (e.error === 'network') setMicError('El dictado por voz necesita conexión a internet.');
+    };
+    r.onend = () => {
+      if (recRef.current === r) recRef.current = null;
+      setListening(false); setInterim('');
+      if (finalText.trim()) onFinal(finalText.trim()); else setEnded((n) => n + 1);
+    };
+    try { r.start(); } catch { recRef.current = null; setTimeout(() => setEnded((n) => n + 1), 600); }
+  };
+  useEffect(() => () => { stopListening(); stop(); }, []);
+  return { speak, stop, startListening, stopListening, speaking, listening, interim, micError, ended, canListen: !!SR };
 }
 
 function aiCartToLines(cart, menu) {
@@ -482,11 +510,21 @@ function AIApp() {
   const [order, setOrder] = useState(null);
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [handsFree, setHandsFree] = useState(true); // micrófono siempre abierto
+  const [typing, setTyping] = useState(false);      // mientras escribe, el micrófono solo se pausa
   const voice = useVoice();
   const endRef = useRef();
+  const sendRef = useRef(() => {});
   // Llaves obligatorias: scrollIntoView devuelve una Promise en Chrome reciente y React la tomaría como cleanup.
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chat, thinking]);
   useEffect(() => { store.set('voice', voiceOn); }, [voiceOn]);
+  // Bucle manos libres: el micrófono se reabre solo mientras no esté hablando Leo, pensando o mostrando el ticket.
+  const micOpen = started && handsFree && !typing && voice.canListen && !voice.micError && !voice.speaking && !thinking && !order && !preview && !busy;
+  useEffect(() => {
+    if (!micOpen) { voice.stopListening(); return; }
+    const t = setTimeout(() => voice.startListening((txt) => sendRef.current(txt)), 300);
+    return () => clearTimeout(t);
+  }, [micOpen, voice.ended]);
 
   if (!menu) return html`<div className="ai"><${Loader} error=${error} onRetry=${reload}/></div>`;
   const P = byId(menu.products), R = byId(menu.restaurants);
@@ -505,14 +543,23 @@ function AIApp() {
     setBusy(false); setPreview(false); setOrder(o);
   };
 
+  const ask = async (h) => {
+    try { return (await rpc('ai_chat', { p_messages: h })) || {}; }
+    catch (e) {
+      if (/no está configurado|inválida/.test(e.message)) throw e;
+      await new Promise((r) => setTimeout(r, 600)); // un reintento silencioso antes de mostrar error
+      return (await rpc('ai_chat', { p_messages: h })) || {};
+    }
+  };
+
   const send = async (text) => {
     text = (text || '').trim();
     if (!text || thinking) return;
-    voice.stop(); setInput('');
+    voice.stop(); voice.stopListening(); setInput('');
     const h = [...history, { role: 'user', text }];
     setHistory(h); setChat((c) => [...c, { role: 'user', text }]); setThinking(true);
     try {
-      const res = (await rpc('ai_chat', { p_messages: h })) || {};
+      const res = await ask(h);
       const reply = typeof res.reply === 'string' && res.reply ? res.reply : 'Disculpa, ¿me lo repites?';
       const sugs = (res.suggestions || []).filter((id) => P[id]).slice(0, 4);
       const newLines = Array.isArray(res.cart) ? aiCartToLines(res.cart, menu) : lines;
@@ -523,14 +570,19 @@ function AIApp() {
       if (res.stage === 'confirmado' && newLines.length) setTimeout(() => finish(newLines), 900);
     } catch (e) {
       setHistory(history);
-      setChat((c) => [...c, { role: 'model', text: '😕 Tuve un problema para responder (' + e.message + '). ¿Lo intentamos de nuevo?' }]);
+      setChat((c) => [...c, { role: 'model', text: '😕 Se me fue la señal un momento. ¿Me repites lo último, por favor?' }]);
+      console.warn('ai_chat', e.message);
     } finally { setThinking(false); }
   };
+  sendRef.current = send;
 
+  // Botón del micrófono: abre/cierra el modo manos libres; si Leo está hablando, lo interrumpe para escucharte.
   const mic = () => {
-    const ok = voice.listen((t) => setInput(t), (t) => send(t));
-    if (!ok) alert('Tu navegador no permite dictado por voz. Puedes escribir tu pedido.');
+    if (voice.speaking) { voice.stop(); setHandsFree(true); return; }
+    setHandsFree(!handsFree);
   };
+  const status = thinking ? 'Pensando…' : voice.speaking ? 'Hablando…' : voice.listening ? '🎙️ Te escucho, habla cuando quieras' :
+    voice.micError ? voice.micError : handsFree && voice.canListen ? 'Abriendo micrófono…' : 'En línea' + (TABLE ? ' · Mesa ' + TABLE : '');
 
   return html`<div className="ai">
     ${!started && html`<div className="splash"><div>
@@ -544,8 +596,7 @@ function AIApp() {
 
     <header className="ai-top">
       <div className=${'avatar' + (voice.speaking || thinking ? ' talking' : '')}><span>🤵</span></div>
-      <div className="grow"><b>${waiter} · Mesero virtual</b><div className="muted" style=${{ fontSize: 13 }}>
-        ${thinking ? 'Escribiendo…' : voice.listening ? 'Te escucho…' : voice.speaking ? 'Hablando…' : 'En línea' + (TABLE ? ' · Mesa ' + TABLE : '')}</div></div>
+      <div className="grow"><b>${waiter} · Mesero virtual</b><div className="muted" style=${{ fontSize: 13 }}>${status}</div></div>
       <button className="icon-btn" title=${voiceOn ? 'Silenciar voz' : 'Activar voz'} onClick=${() => { if (voiceOn) voice.stop(); setVoiceOn(!voiceOn); }}>${voiceOn ? '🔊' : '🔇'}</button>
     </header>
 
@@ -569,16 +620,19 @@ function AIApp() {
       <span className="count">${cartCount(lines)}</span><span className="grow" style=${{ textAlign: 'left' }}>Tu pedido</span><b>${money(cartTotal(lines))}</b><span>›</span>
     <//></div>`}
     ${chat.length <= 2 && html`<div className="quick">${QUICK.map((q) => html`<button key=${q} onClick=${() => send(q.replace(/^\S+\s/, ''))}>${q}</button>`)}</div>`}
-    <form className="composer" onSubmit=${(e) => { e.preventDefault(); send(input); }}>
-      ${voice.canListen && html`<button type="button" className=${'mic' + (voice.listening ? ' on' : '')} aria-label="Hablar" onClick=${mic}>🎙️</button>`}
-      <input className="field grow" value=${input} placeholder=${voice.listening ? 'Te escucho…' : 'Escribe o toca el micrófono…'} onChange=${(e) => setInput(e.target.value)}/>
+    <form className="composer" onSubmit=${(e) => { e.preventDefault(); document.activeElement?.blur(); send(input); }}>
+      ${voice.canListen && html`<button type="button" className=${'mic' + (voice.listening ? ' on' : handsFree ? ' armed' : '')}
+        aria-label=${handsFree ? 'Cerrar micrófono' : 'Abrir micrófono'} title=${handsFree ? 'Micrófono abierto (toca para cerrarlo)' : 'Micrófono cerrado (toca para abrirlo)'} onClick=${mic}>${handsFree ? '🎙️' : '🔇'}</button>`}
+      <input className="field grow" value=${voice.listening && voice.interim ? voice.interim : input}
+        placeholder=${voice.listening ? 'Te escucho… habla cuando quieras' : handsFree && voice.canListen ? 'Habla o escribe tu pedido…' : 'Escribe tu pedido…'}
+        onFocus=${() => setTyping(true)} onBlur=${() => setTyping(false)} onChange=${(e) => setInput(e.target.value)}/>
       <button className="send" aria-label="Enviar" disabled=${thinking}>➤</button>
     </form>
 
     ${preview && html`<${Ticket} preview busy=${busy} order=${{ items: lines, total: cartTotal(lines), table_no: TABLE, source: 'ia' }} menu=${menu}
       onClose=${() => setPreview(false)} onConfirm=${() => finish(lines)}/>`}
     ${order && html`<${Ticket} order=${order} menu=${menu} onClose=${() => setOrder(null)}
-      onNew=${() => { setOrder(null); setLines([]); setChat([]); setHistory([]); setStarted(false); }}/>`}
+      onNew=${() => { setOrder(null); setLines([]); setChat([]); setHistory([]); setStarted(false); setHandsFree(true); }}/>`}
   </div>`;
 }
 
