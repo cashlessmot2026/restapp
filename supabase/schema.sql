@@ -1,0 +1,305 @@
+-- =========================================================
+-- RestApp · Menú digital (Golden Crunch · Mar & Sabor · La Famiglia)
+-- Esquema, seguridad (RLS) y funciones RPC.
+-- Las credenciales del admin y la API key de Gemini se cargan
+-- aparte (no se versionan).
+-- =========================================================
+
+create extension if not exists pgcrypto with schema extensions;
+create extension if not exists http with schema extensions;
+
+-- ---------- Tablas ----------
+create table if not exists public.restaurants (
+  id text primary key,
+  name text not null,
+  tagline text default '',
+  logo text default '',
+  menu_image text default '',
+  colors jsonb not null default '{}'::jsonb,
+  sort int default 0,
+  active boolean default true
+);
+
+create table if not exists public.categories (
+  id uuid primary key default gen_random_uuid(),
+  restaurant_id text not null references public.restaurants(id) on delete cascade,
+  name text not null,
+  note text default '',
+  sort int default 0,
+  active boolean default true
+);
+
+create table if not exists public.products (
+  id uuid primary key default gen_random_uuid(),
+  restaurant_id text not null references public.restaurants(id) on delete cascade,
+  category_id uuid references public.categories(id) on delete set null,
+  name text not null,
+  description text default '',
+  price int not null default 0,
+  image text default '',
+  options jsonb default '[]'::jsonb,   -- [{"name":"Salsa","choices":["Ají","Ahogado"]}]
+  allow_half boolean default false,     -- pizzas por mitades
+  tags text default '',
+  sort int default 0,
+  active boolean default true
+);
+
+create table if not exists public.extras (
+  id uuid primary key default gen_random_uuid(),
+  restaurant_id text not null references public.restaurants(id) on delete cascade,
+  name text not null,
+  price int not null default 0,
+  kind text not null default 'adicional' check (kind in ('adicional','borde')),
+  category_ids uuid[] default '{}',     -- vacío = aplica a todas las categorías
+  sort int default 0,
+  active boolean default true
+);
+
+create table if not exists public.orders (
+  id uuid primary key default gen_random_uuid(),
+  code text not null,
+  created_at timestamptz default now(),
+  source text default 'menu',
+  table_no text default '',
+  items jsonb not null default '[]'::jsonb,
+  total int not null default 0,
+  notes text default '',
+  status text default 'nuevo'
+);
+
+create table if not exists public.settings (key text primary key, value text);
+create table if not exists public.secrets  (key text primary key, value text);
+create table if not exists public.admins   (username text primary key, pass_hash text not null);
+create table if not exists public.admin_sessions (
+  token uuid primary key default gen_random_uuid(),
+  username text not null references public.admins(username) on delete cascade,
+  expires_at timestamptz default now() + interval '12 hours'
+);
+
+-- ---------- RLS ----------
+alter table public.restaurants    enable row level security;
+alter table public.categories     enable row level security;
+alter table public.products       enable row level security;
+alter table public.extras         enable row level security;
+alter table public.orders         enable row level security;
+alter table public.settings       enable row level security;
+alter table public.secrets        enable row level security;
+alter table public.admins         enable row level security;
+alter table public.admin_sessions enable row level security;
+
+drop policy if exists "lectura publica" on public.restaurants;
+drop policy if exists "lectura publica" on public.categories;
+drop policy if exists "lectura publica" on public.products;
+drop policy if exists "lectura publica" on public.extras;
+drop policy if exists "lectura publica" on public.settings;
+create policy "lectura publica" on public.restaurants for select using (true);
+create policy "lectura publica" on public.categories  for select using (true);
+create policy "lectura publica" on public.products    for select using (true);
+create policy "lectura publica" on public.extras      for select using (true);
+create policy "lectura publica" on public.settings    for select using (true);
+
+-- Nada de escritura directa desde el navegador: todo pasa por funciones.
+revoke insert, update, delete on public.restaurants, public.categories, public.products,
+  public.extras, public.orders, public.settings from anon, authenticated;
+revoke all on public.secrets, public.admins, public.admin_sessions, public.orders from anon, authenticated;
+
+-- ---------- Auth admin ----------
+create or replace function public._admin_check(p_token uuid) returns text
+language plpgsql security definer set search_path = public as $$
+declare u text;
+begin
+  select username into u from admin_sessions where token = p_token and expires_at > now();
+  if u is null then raise exception 'Sesión expirada, vuelve a iniciar sesión' using errcode = '28000'; end if;
+  return u;
+end $$;
+revoke execute on function public._admin_check(uuid) from public, anon, authenticated;
+
+create or replace function public.admin_login(p_user text, p_pass text) returns uuid
+language plpgsql security definer set search_path = public, extensions as $$
+declare t uuid;
+begin
+  if not exists (select 1 from admins where username = lower(trim(p_user)) and pass_hash = crypt(p_pass, pass_hash)) then
+    perform pg_sleep(0.6);
+    raise exception 'Usuario o contraseña incorrectos';
+  end if;
+  delete from admin_sessions where expires_at < now();
+  insert into admin_sessions(username) values (lower(trim(p_user))) returning token into t;
+  return t;
+end $$;
+
+create or replace function public.admin_logout(p_token uuid) returns void
+language sql security definer set search_path = public as $$
+  delete from admin_sessions where token = p_token;
+$$;
+
+create or replace function public.admin_change_password(p_token uuid, p_new text) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare u text := _admin_check(p_token);
+begin
+  if length(coalesce(p_new,'')) < 4 then raise exception 'La contraseña debe tener al menos 4 caracteres'; end if;
+  update admins set pass_hash = crypt(p_new, gen_salt('bf')) where username = u;
+end $$;
+
+-- Guardar (insertar o actualizar) cualquier fila del menú
+create or replace function public.admin_save(p_token uuid, p_table text, p_row jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare cols text; res jsonb; r jsonb := p_row;
+begin
+  perform _admin_check(p_token);
+  if p_table = 'settings' then
+    insert into settings(key, value) values (r->>'key', r->>'value')
+      on conflict (key) do update set value = excluded.value
+      returning to_jsonb(settings.*) into res;
+    return res;
+  end if;
+  if p_table not in ('restaurants','categories','products','extras') then
+    raise exception 'Tabla no permitida';
+  end if;
+  if coalesce(r->>'id','') = '' then
+    if p_table = 'restaurants' then raise exception 'El restaurante necesita un id'; end if;
+    r := r || jsonb_build_object('id', gen_random_uuid());
+  end if;
+  select string_agg(format('%I = excluded.%I', column_name, column_name), ', ')
+    into cols
+    from information_schema.columns
+   where table_schema = 'public' and table_name = p_table and column_name <> 'id' and r ? column_name;
+  if cols is null then raise exception 'No hay columnas para guardar'; end if;
+  execute format(
+    'insert into public.%1$I select * from jsonb_populate_record(null::public.%1$I, $1)
+       on conflict (id) do update set %2$s returning to_jsonb(%1$I.*)', p_table, cols)
+    into res using r;
+  return res;
+end $$;
+
+create or replace function public.admin_delete(p_token uuid, p_table text, p_id text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform _admin_check(p_token);
+  if p_table not in ('restaurants','categories','products','extras','orders') then
+    raise exception 'Tabla no permitida';
+  end if;
+  execute format('delete from public.%I where id::text = $1', p_table) using p_id;
+end $$;
+
+create or replace function public.admin_orders(p_token uuid, p_limit int default 100) returns setof public.orders
+language plpgsql security definer set search_path = public as $$
+begin
+  perform _admin_check(p_token);
+  return query select * from orders order by created_at desc limit least(coalesce(p_limit,100), 500);
+end $$;
+
+create or replace function public.admin_order_status(p_token uuid, p_id uuid, p_status text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform _admin_check(p_token);
+  update orders set status = p_status where id = p_id;
+end $$;
+
+create or replace function public.admin_set_secret(p_token uuid, p_key text, p_value text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform _admin_check(p_token);
+  if p_key not in ('gemini_key') then raise exception 'Clave no permitida'; end if;
+  insert into secrets(key, value) values (p_key, p_value)
+    on conflict (key) do update set value = excluded.value;
+end $$;
+
+create or replace function public.admin_secret_status(p_token uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k text;
+begin
+  perform _admin_check(p_token);
+  select value into k from secrets where key = 'gemini_key';
+  return jsonb_build_object('gemini_key_set', coalesce(k,'') <> '',
+    'gemini_key_hint', case when coalesce(k,'') = '' then '' else '••••' || right(k, 4) end);
+end $$;
+
+-- ---------- Pedidos públicos ----------
+create or replace function public.create_order(p_order jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare c text; o orders;
+begin
+  if jsonb_typeof(p_order->'items') <> 'array' or jsonb_array_length(p_order->'items') = 0 then
+    raise exception 'El pedido está vacío';
+  end if;
+  if jsonb_array_length(p_order->'items') > 60 then raise exception 'Pedido demasiado grande'; end if;
+  c := upper(substr(translate(encode(gen_random_bytes(6), 'base64'), '+/=0O1Il', ''), 1, 4));
+  insert into orders(code, source, table_no, items, total, notes)
+  values (c, left(coalesce(p_order->>'source','menu'), 10), left(coalesce(p_order->>'table_no',''), 20),
+          p_order->'items', coalesce((p_order->>'total')::int, 0), left(coalesce(p_order->>'notes',''), 500))
+  returning * into o;
+  return jsonb_build_object('id', o.id, 'code', o.code, 'created_at', o.created_at);
+end $$;
+
+-- ---------- Mesero IA (Gemini) ----------
+-- La API key vive en public.secrets y nunca sale de la base de datos.
+create or replace function public.ai_chat(p_messages jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  k text; m text; sys text; menu jsonb; body jsonb; contents jsonb;
+  resp extensions.http_response; txt text; res jsonb;
+begin
+  select value into k from secrets where key = 'gemini_key';
+  if coalesce(k,'') = '' then raise exception 'El mesero IA aún no está configurado'; end if;
+  m := coalesce(nullif((select value from settings where key = 'ai_model'), ''), 'gemini-flash-lite-latest');
+  if jsonb_typeof(p_messages) <> 'array' or jsonb_array_length(p_messages) = 0 or jsonb_array_length(p_messages) > 80 then
+    raise exception 'Conversación inválida';
+  end if;
+
+  select jsonb_agg(jsonb_build_object(
+           'restaurante', r.name, 'restaurante_id', r.id,
+           'categorias', (select coalesce(jsonb_agg(jsonb_build_object(
+               'categoria', c.name, 'nota', c.note,
+               'productos', (select coalesce(jsonb_agg(jsonb_build_object(
+                   'id', p.id, 'nombre', p.name, 'descripcion', p.description, 'precio', p.price,
+                   'opciones', p.options, 'mitades', p.allow_half) order by p.sort), '[]'::jsonb)
+                 from products p where p.category_id = c.id and p.active)
+             ) order by c.sort), '[]'::jsonb)
+             from categories c where c.restaurant_id = r.id and c.active),
+           'adicionales', (select coalesce(jsonb_agg(jsonb_build_object(
+               'id', e.id, 'nombre', e.name, 'precio', e.price, 'tipo', e.kind,
+               'solo_categorias', (select coalesce(jsonb_agg(c2.name), '[]'::jsonb) from categories c2 where c2.id = any(e.category_ids))
+             ) order by e.sort), '[]'::jsonb)
+             from extras e where e.restaurant_id = r.id and e.active)
+         ) order by r.sort)
+    into menu
+    from restaurants r where r.active;
+
+  sys := coalesce((select value from settings where key = 'ai_prompt'), '')
+         || E'\n\nCARTA ACTUAL (JSON, precios en pesos colombianos):\n' || coalesce(menu::text, '[]');
+
+  select jsonb_agg(jsonb_build_object(
+           'role', case when e->>'role' = 'model' then 'model' else 'user' end,
+           'parts', jsonb_build_array(jsonb_build_object('text', left(coalesce(e->>'text',''), 4000)))))
+    into contents
+    from jsonb_array_elements(p_messages) e;
+
+  body := jsonb_build_object(
+    'system_instruction', jsonb_build_object('parts', jsonb_build_array(jsonb_build_object('text', sys))),
+    'contents', contents,
+    'generationConfig', jsonb_build_object('responseMimeType', 'application/json', 'temperature', 0.6));
+
+  perform http_set_curlopt('CURLOPT_TIMEOUT_MS', '25000');
+  select * into resp from http((
+    'POST',
+    'https://generativelanguage.googleapis.com/v1beta/models/' || m || ':generateContent',
+    array[http_header('x-goog-api-key', k)],
+    'application/json',
+    body::text)::http_request);
+
+  if resp.status <> 200 then
+    raise exception 'El mesero IA no respondió (código %)', resp.status;
+  end if;
+  txt := (resp.content::jsonb) #>> '{candidates,0,content,parts,0,text}';
+  begin
+    res := txt::jsonb;
+  exception when others then
+    res := jsonb_build_object('reply', coalesce(txt, 'Disculpa, ¿me repites por favor?'));
+  end;
+  return res;
+end $$;
+
+-- La llamada a Gemini puede tardar unos segundos.
+alter role anon set statement_timeout = '30s';
+notify pgrst, 'reload config';
+notify pgrst, 'reload schema';
