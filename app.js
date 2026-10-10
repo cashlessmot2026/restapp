@@ -96,7 +96,7 @@ const cartCount = (lines) => lines.reduce((s, l) => s + l.qty, 0);
 
 function useCart() {
   const [lines, setLines] = useState(() => store.get('cart', [], sessionStorage));
-  useEffect(() => store.set('cart', lines, sessionStorage), [lines]);
+  useEffect(() => { store.set('cart', lines, sessionStorage); }, [lines]);
   const add = (l) => setLines((ls) => {
     const same = ls.find((x) => x.product_id === l.product_id && x.half_id === l.half_id && x.option === l.option &&
       x.notes === l.notes && JSON.stringify(x.extras) === JSON.stringify(l.extras));
@@ -395,11 +395,11 @@ function MenuApp() {
         </div>
         <div className="rest-grid">${menu.restaurants.map((r) => {
           const c = r.colors || {};
-          return html`<${Glow} key=${r.id} className="rest-btn" c1=${c.primary} c2=${c.secondary || c.accent} inner=${c.card}
+          return html`<${Glow} key=${r.id} className="rest-btn" c1=${c.primary} c2=${c.secondary || c.accent} inner=${c.logoBg || c.card}
             onClick=${() => go('#/r/' + r.id)} aria-label=${'Ver menú de ' + r.name} style=${{ color: c.text }}>
             <img src=${asset(r.logo)} alt=${r.name}/>
-            <div className="tag" style=${{ color: c.muted }}>${r.tagline}</div>
-            <span className="cta" style=${{ background: c.primary, color: c.onPrimary }}>Ver menú →</span>
+            <div className="tag" style=${{ color: c.logoBg ? c.logoText || '#e9dcc6' : c.muted }}>${r.tagline}</div>
+            <span className="cta" style=${{ background: c.logoBg ? c.secondary : c.primary, color: c.onPrimary }}>Ver menú →</span>
           <//>`;
         })}</div>
       </div></div>`}
@@ -484,8 +484,9 @@ function AIApp() {
   const [busy, setBusy] = useState(false);
   const voice = useVoice();
   const endRef = useRef();
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [chat, thinking]);
-  useEffect(() => store.set('voice', voiceOn), [voiceOn]);
+  // Llaves obligatorias: scrollIntoView devuelve una Promise en Chrome reciente y React la tomaría como cleanup.
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chat, thinking]);
+  useEffect(() => { store.set('voice', voiceOn); }, [voiceOn]);
 
   if (!menu) return html`<div className="ai"><${Loader} error=${error} onRetry=${reload}/></div>`;
   const P = byId(menu.products), R = byId(menu.restaurants);
@@ -590,7 +591,7 @@ const textToOpts = (t) => (t || '').split('\n').map((l) => l.trim()).filter(Bool
   const choices = rest.join(':').split(',').map((s) => s.trim()).filter(Boolean);
   return choices.length ? { name: n.trim(), choices } : null;
 }).filter(Boolean);
-const COLOR_KEYS = [['primary', 'Principal'], ['secondary', 'Secundario'], ['accent', 'Acento'], ['bg', 'Fondo'], ['card', 'Tarjetas'], ['text', 'Texto'], ['muted', 'Texto suave'], ['onPrimary', 'Texto sobre principal']];
+const COLOR_KEYS = [['primary', 'Principal'], ['secondary', 'Secundario'], ['accent', 'Acento'], ['bg', 'Fondo'], ['card', 'Tarjetas'], ['text', 'Texto'], ['muted', 'Texto suave'], ['onPrimary', 'Texto sobre principal'], ['logoBg', 'Fondo del botón de inicio']];
 
 function Editor({ title, fields, value, onSave, onClose }) {
   const [v, setV] = useState(value);
@@ -668,8 +669,8 @@ function AdminPanel({ token, onLogout }) {
   const [rid, setRid] = useState(store.get('adm-rid', 'golden'));
   const [edit, setEdit] = useState(null);
   const [msg, toast] = useToast();
-  useEffect(() => store.set('adm-tab', tab), [tab]);
-  useEffect(() => store.set('adm-rid', rid), [rid]);
+  useEffect(() => { store.set('adm-tab', tab); }, [tab]);
+  useEffect(() => { store.set('adm-rid', rid); }, [rid]);
   if (!menu) return html`<div className="admin"><${Loader} error=${error} onRetry=${reload}/></div>`;
 
   const wrap = (fn) => async (...a) => {

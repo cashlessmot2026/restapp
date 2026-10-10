@@ -17,7 +17,7 @@ insert into public.restaurants (id, name, tagline, logo, menu_image, colors, sor
  '{"bg":"#0b0a08","card":"#17140f","primary":"#D4A537","secondary":"#F5D77E","accent":"#B8862B","text":"#f7f0e1","muted":"#b9aa8c","onPrimary":"#1a1206"}', 1),
 ('marysabor', 'Mar & Sabor', 'Sea Food · Del mar a tu mesa',
  'assets/logos/marysabor.png', 'assets/menus/marysabor.jpg',
- '{"bg":"#FBF6EE","card":"#ffffff","primary":"#1B3A6B","secondary":"#4A90C2","accent":"#E8505B","text":"#16294d","muted":"#5f6f8c","onPrimary":"#ffffff"}', 2),
+ '{"bg":"#FBF6EE","card":"#ffffff","primary":"#1B3A6B","secondary":"#4A90C2","accent":"#E8505B","text":"#16294d","muted":"#5f6f8c","onPrimary":"#ffffff","logoBg":"#13294b"}', 2),
 ('famiglia', 'La Famiglia', 'Pizzeria Italiana · Tradizione · Sapore · Amore',
  'assets/logos/famiglia.png', 'assets/menus/famiglia.jpg',
  '{"bg":"#F6F0E2","card":"#fffaf0","primary":"#22331f","secondary":"#B08D3E","accent":"#B3261E","text":"#1d2a22","muted":"#6b6a55","onPrimary":"#fffaf0"}', 3);
